@@ -54,7 +54,7 @@ SoftwareSerial mySerial(8, 9); // RX, TX
 
 //data buffer set up
 int sampleNumber = 0;
-const int numSamples = 5;
+const int numSamples = 10;
 String sampleData[numSamples];
 int pressureData = 0;
 int sampleStamp;
@@ -65,7 +65,7 @@ String dataString;
 String sampleStr = ";";
 String valueStr = ";";
 
-volatile int offTime = 2; // cycles board is off for (1 cycle = 8 seconds)
+volatile int offTime = 75; // cycles board is off for (1 cycle = 8 seconds)
 volatile int seconds = 0;
 volatile int awake_time = 10; //seconds board is awake for
 volatile int awake_status = 1; //1 for awake, 0 for asleep
@@ -95,6 +95,7 @@ void setup() {
   Serial.println(TIME);
   RTC.adjust(DateTime(DATE, TIME));    //sets the RTC to the date & time specified above
 
+  
   
   //set pins for communication with modem
   pinMode(modemRx, INPUT);
@@ -151,9 +152,7 @@ void loop() {
       buffer1[i] = ' ';
     }
 
-    //dataString = dispTime();
-    //print test string
-    dataString = "test;";
+    dataString = dispTime();
     
     while (!mySerial.available()) {} // Wait for characters on serial port
     delay(100);
@@ -203,12 +202,11 @@ void loop() {
 
 
 String dispTime() {
-  const int len = 32;
-  static char buf[len];
-  DateTime now = RTC.now();               // get the current date and time on the RTC
-  timeStamp = now.toString(buf, len);     // set timeStamp to current date and time in Mon DD YYYY format
-  delay(100); 
 
-  return timeStamp;
-
+    DateTime now = RTC.now();
+   
+    const int len = 32;
+    static char buf[len];
+    
+    return now.toStringYMD(buf,len);
 }
