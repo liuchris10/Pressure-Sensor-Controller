@@ -1,0 +1,214 @@
+#include <SoftwareSerial.h>
+
+/**
+ * Code to control a pressure sensor Pressure Sensor. Keeps
+ * board awake for time defined by int 'seconds' and sleeps
+ * the board for multiple increments of 8 seconds using the
+ * WDT and LowPower Library. Adjust the value of OffTime
+ * to change the number of 8 second increments.
+ *
+ * Author: Jeremy Halligan and Christopher Liu
+ * Date: 8/5/2015
+ */
+
+#include <LowPower.h>
+#include <ctype.h>
+#include <SPI.h>
+#include <Wire.h>
+#include <RTClib.h>
+#include <RTC_DS3234.h>
+
+// Avoid spurious warnings
+#undef PROGMEM
+#define PROGMEM __attribute__(( section(".progmem.data") ))
+#undef PSTR
+#define PSTR(s) (__extension__({static prog_char __c[] PROGMEM = (s); &__c[0];}))
+
+// Create an RTC instance, using the chip select pin it's connected to
+RTC_DS3234 RTC(10);             //SS Pin connected to Pin 10
+
+
+/*     SET DATE AND TIME HERE    */
+char DATE[] = "Aug 05 2015";   //  Set Month Day Year
+char TIME[] = "12:00:00";      //  24hr Format
+
+
+
+byte pressPin = 2; //attach power toggle for pressure pin here
+/**
+ * modem serial ports
+ */
+byte modemTx = 0;
+byte modemRx = 1;
+
+/**
+ * modem serial ports
+ */
+byte pressTx = 8;
+byte pressRx = 9;
+
+/**
+ * pressure sensor serial ports
+ */
+SoftwareSerial mySerial(8, 9); // RX, TX
+
+//data buffer set up
+int sampleNumber = 0;
+const int numSamples = 5;
+String sampleData[numSamples];
+int pressureData = 0;
+int sampleStamp;
+char buffer1[7];
+
+String timeStamp;
+String dataString;
+String sampleStr = ";";
+String valueStr = ";";
+
+volatile int offTime = 2; // cycles board is off for (1 cycle = 8 seconds)
+volatile int seconds = 0;
+volatile int awake_time = 10; //seconds board is awake for
+volatile int awake_status = 1; //1 for awake, 0 for asleep
+
+/**
+ * ISR for timer 1, increments in seconds.
+ */
+ISR(TIMER1_COMPA_vect) {
+  seconds ++;
+  if (seconds == awake_time) {
+    seconds = 0;
+    awake_status = 0;
+  }
+}
+
+void setup() {
+  Serial.begin(9600);
+  mySerial.begin(9600);
+
+
+  pinMode(pressPin, OUTPUT);
+  SPI.begin();
+  RTC.begin();
+  Serial.print("Setting time to... ");
+  Serial.print(DATE);
+  Serial.print(' ');
+  Serial.println(TIME);
+  RTC.adjust(DateTime(DATE, TIME));    //sets the RTC to the date & time specified above
+
+  
+  //set pins for communication with modem
+  pinMode(modemRx, INPUT);
+  pinMode(modemTx, OUTPUT);
+  delay(5);
+
+
+  /** Timer 1 Start-up**/
+  //Timer1 initialization for awake time
+  cli();
+  TCCR1A = 0; //Set Timer 1 registers to 0
+  TCCR1B = 0;
+  // setCTC compare register
+  OCR1A = 15264; //this value is approx. 1 second worth of clock cycles
+  // CTC Mode for Timer 1
+  TCCR1B |= (1 << WGM12);
+  //Prescale the timer to 1024 prescaler
+  TCCR1B |= (1 << CS10);
+  TCCR1B |= (1 << CS12);
+  //Enable timer compare interrupt
+  TIMSK1 |= (1 << OCIE1A); //Starts timer 1 ********
+  //turn back on global interrupts.
+  sei();
+
+}
+
+void loop() {
+  //set pins for communication with pressure sensor
+  //set pins for communication with modem
+  //pinMode(pressRx, INPUT);
+  //pinMode(pressTx, OUTPUT);
+  //delay(5);
+  digitalWrite(pressPin, HIGH);
+  sampleNumber++;
+  
+  //wait for voltage to stabilize
+  delay(20000);
+
+  for (int i = 0, sampleStamp = 0; i < numSamples; i++, sampleStamp++) {
+
+    //pressureData = 0;
+    mySerial.flush();     //Flush the serial
+    /**
+     * Send command to mySerial port, which is 8(RX), 9 (TX)
+     * The pressure sensor command 'g' followed by a carriage return
+     * will trigger a new reading
+     */
+    mySerial.print('*');
+    mySerial.print('G');
+    mySerial.print('\r');
+
+    //clear the buffer
+    for (int i = 0; i < 6; i++) {
+      buffer1[i] = ' ';
+    }
+
+    //dataString = dispTime();
+    //print test string
+    dataString = "test;";
+    
+    while (!mySerial.available()) {} // Wait for characters on serial port
+    delay(100);
+    //read in first 6 characters to buffer
+    for (int i = 0; i < 6; i++) {
+      buffer1[i] = mySerial.read();
+    }
+    //mySerial.readBytesUntil('n', buffer1, 7);
+
+    //concatanate all data into one string
+    dataString.concat(valueStr);
+    dataString.concat(buffer1);
+    delay(150);
+    dataString.concat(sampleStr);
+    dataString.concat(sampleNumber);
+    dataString.concat(sampleStamp);
+    delay(150);
+
+    //store data string into an array
+    sampleData[i] = dataString;
+    delay(100);
+
+    //reset seconds counter, and wait for 5 seconds until next sample
+    delay(10000);
+    //wait for Serial line to clear before taking next sample
+    mySerial.flush();
+  };
+
+
+  //Write to modem serial port, all values in array
+  for (int i = 0; i < numSamples; i++) {
+    Serial.println(sampleData[i]);
+  }
+
+  //turn off pressure pin
+  digitalWrite(pressPin, LOW);
+  delay(5);
+  Serial.println("Sleep.");
+  delay(5);
+  
+  //sleep
+  for (int index = 0; index < offTime; index++) {
+    LowPower.powerDown(SLEEP_8S, ADC_OFF, BOD_OFF);
+  }
+}
+
+
+
+String dispTime() {
+  const int len = 32;
+  static char buf[len];
+  DateTime now = RTC.now();               // get the current date and time on the RTC
+  timeStamp = now.toString(buf, len);     // set timeStamp to current date and time in Mon DD YYYY format
+  delay(100); 
+
+  return timeStamp;
+
+}
