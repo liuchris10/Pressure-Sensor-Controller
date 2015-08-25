@@ -1,16 +1,10 @@
-//ISSUES:
-//Problem with interrupting it during delays when sampling
-//Can communicate and receive Pressure readings when echoing to sensor, but will not parse then when sampling
-//see data dump from modem for reference
-//Need to put in a timeout if no input after like 5 minutes when echoing
-//I think that's it
-
 /**
- * Code to control a pressure sensor Pressure Sensor. Keeps
- * board awake for time defined by int 'seconds' and sleeps
- * the board for multiple increments of 8 seconds using the
- * WDT and LowPower Library. Adjust the value of offCycles
- * to change the number of 8 second increments.
+ * Code to control a pressure sensor and 
+ * take samples, had an automated sleep function
+ * to allow long deployment times. 
+ * Allows writing to Datalogger modem for storage
+ * and allows direct talk through to modem and 
+ * pressure sensor via hardware serial/
  *
  * Author: Jeremy Halligan and Christopher Liu
  * Date: 8/7/2015
@@ -49,14 +43,17 @@ char TIME[] = "12:00:00";    //  24hr Format
 byte pressPin = 2;   //  Control pin to turn pressure sensor on/off
 byte  intPin = 3;     //  Pin 3 for interrupt (1)
 
-byte  commTx = 0;    //  Comm Serial Port Pins
+//  Comm Serial Port Pins (Hardware Serial)
+byte  commTx = 0;    
 byte  commRx = 1;
 
-byte  modemTx = 6;    //  Modem Serial Port Pins
+//  Modem Serial Port Pins (Software Serial
+byte  modemTx = 6;    
 byte  modemRx = 7;
 SoftwareSerial modemSerial(modemTx, modemRx);
 
-byte  pressTx = 8;    //  Pressure Sensor Serial Port Pins
+//  Pressure Sensor Serial Port Pins (Software Serial)
+byte  pressTx = 8;    
 byte  pressRx = 9;
 SoftwareSerial pressSerial(pressTx, pressRx);   //Sets up Software Serial for Pressure Sensor
 
@@ -619,3 +616,7 @@ void echoPressure() {
   }
   digitalWrite(pressPin, LOW);   // turn off the pressure sensor
 }
+
+
+
+
