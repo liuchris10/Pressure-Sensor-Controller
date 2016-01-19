@@ -1,0 +1,893 @@
+/**
+ * Code to control a pressure sensor and
+ * take samples, had an automated sleep function
+ * to allow long deployment times.
+ * Allows writing to Datalogger modem for storage
+ * and allows direct talk through to modem and
+ * pressure sensor via hardware serial
+ *
+ * Author: Jeremy Halligan and Christopher Liu
+ * Date: 9/10/2015
+ */
+
+#include <SoftwareSerial.h>
+#include <LowPower.h>
+#include <ctype.h>
+#include <SPI.h>
+#include <Wire.h>
+#include <RTClib.h>
+#include <RTC_DS3234.h>
+#include <avr/pgmspace.h>
+#include <SD.h>
+
+// Avoid spurious warnings, used for setting up the RTC
+// #undef PROGMEM
+// #define PROGMEM __attribute__(( section(".progmem.data") ))
+// #undef PSTR
+// #define PSTR(s) (__extension__({static prog_char __c[] PROGMEM = (s); &__c[0];}))
+
+// Create an RTC instance, using the chip select pin
+RTC_DS3234 RTC(10);             //SS Pin connected to Pin 10
+
+
+//_______________________SETTINGS______________________//
+
+
+//----SET DATE AND TIME HERE----//
+String DATESTAMP;
+char DATE[11];
+char TIME[] = "12:00:00";    //  24hr Format
+
+
+
+//---------PIN SETUP-----------//
+//  Comm Serial Port Pins (Hardware Serial)
+byte  commTx = 0;
+byte  commRx = 1;
+
+byte  intPin = 2;        //  Pin 2 for interrupt (0)
+byte  pressSwitch = 3;   //  Control pin to turn pressure sensor on/off
+byte  SDSwitch = 4;      //  Control pin for SD Card
+
+//  Modem Serial Port Pins (Software Serial)
+byte  modemTx = 5;
+byte  modemRx = 6;
+SoftwareSerial modemSerial(modemTx, modemRx);
+
+//  Pressure Sensor Serial Port Pins (Software Serial)
+byte  pressTx = 7;
+byte  pressRx = 8;
+SoftwareSerial pressSerial(pressTx, pressRx);   //Sets up Software Serial for Pressure Sensor
+
+const byte sdPin = 9; //CS pin for sdCard
+
+//---SAMPLING CONFIGURATIONS---//
+
+unsigned int numSamples = 10;    //  Dictates how many samples will be taken each interval
+unsigned int offCycles = 2;     //  # of cycles board is off for (1 cycle = 8 seconds)
+unsigned int secondsBetweenSamples = 10; //seconds between samples
+unsigned int waitTimeBoot = 20; //amount of seconds to wait before beginning sampling
+const int menuTimeOut60 = 60; //seconds before returning to main menu in echo mode
+const String space = " ";
+const int menuTimeOut20 = 20; //time out in seconds for menu
+
+//   Volatile Variables   //
+volatile boolean allowInterrupts = 1; //device status flag, 1 allows interrupts, 0 does not allow
+volatile boolean menuFlag = 0; //flag to return to menu from the inside of wakeUpHandler
+volatile boolean broke = 0;          //used to break out of functions
+volatile boolean interruptFlag = 0; //flag to show that device was interrupted, 0 for true
+volatile int device_status = 0; // 0 for sleep, 1 for sampling, 2 for permanent sleep
+volatile int seconds = 0; //global counter, increments every second
+volatile int intTime = 0; //interrupt timer to prevent multiple interrupts
+volatile int prevIntTime = 0; //secondary interrupt timer
+
+//    Variables    //
+int serialData = 0; //data that comes in on the Hardware serial port
+int sampleNumber = 0; //  Keeps count of the samples
+int sampleStamp; //index for sample number in set
+char buffer1[7]; //holds incoming data from pressure sensor
+String timeStamp; //holds timestring from RTC
+String dataString; //holds the entire string to be printed to modem
+int jIndex; //index for for loops
+int index; // another index for loops
+char commandString[12]; //string for date/time
+
+
+/**
+ * ISR for timer 1, increments in seconds.
+ */
+ISR(TIMER1_COMPA_vect) {
+  seconds ++;
+  if (seconds == 1000) {
+    seconds = 0;
+  }
+}
+
+void setup() {
+  Serial.begin(9600);      //serial comm with computer interface
+  pressSerial.begin(9600); //serial comm with Pressure Sensor
+  modemSerial.begin(9600); //serial comm with modem
+
+  SPI.begin();             //Initialize SPI and RTC for the RTC
+  RTC.begin();
+
+  pinMode(pressSwitch, OUTPUT);                  //Set up Pressure sensor control pin
+  pinMode(SDSwitch, OUTPUT);                    //Set up Power control pin
+  digitalWrite(SDSwitch, HIGH);                 //Turn on power to devices
+  // Prints Date and Time set
+  Serial.println();
+  Serial.print(F("Setting time to  : "));
+  delay(10);
+  Serial.print(F(__DATE__));
+  Serial.print(F(" "));
+  Serial.println(F(__TIME__));
+  RTC.adjust(DateTime(__DATE__, __TIME__));    //sets the RTC to the date & time file was compiled
+
+  //set pins for communication with modem
+  pinMode(commRx, INPUT);
+  pinMode(commTx, OUTPUT);
+
+  delay(5);
+
+  /** Timer 1 Start-up**/
+  //   Timer1 initialization for awake time
+  cli();
+  TCCR1A = 0; //Set Timer 1 registers to 0
+  TCCR1B = 0;
+  // setCTC compare register
+  OCR1A = 15264; //this value is approx. 1 second worth of clock cycles
+  // CTC Mode for Timer 1
+  TCCR1B |= (1 << WGM12);
+  //Prescale the timer to 1024 prescaler
+  TCCR1B |= (1 << CS10);
+  TCCR1B |= (1 << CS12);
+  //Enable timer compare interrupt
+  TIMSK1 |= (1 << OCIE1A); //Starts timer 1 ********
+  //turn back on global interrupts.
+  sei();
+
+
+  /**Initialize SD Card**/
+  Serial.println(F("Initializing SD Card..."));
+  delay(5);
+
+  //Initialize SD Card
+  if (!SD.begin(sdPin)) {
+    Serial.println(F("Card failed, or not present"));
+  }
+  else {
+    Serial.println(F("Card initialized."));
+  }
+  attachInterrupt(0, intPIN2, CHANGE); //attach interrupt to pin 2
+}
+
+void loop() {
+  MainMenu(); //load into device menu
+}
+
+
+
+/*____________INTERRUPTS_________*/
+
+/**
+ * ISR to detect interrupt from computer. Jump pin 3 to pin 0 on Arduino
+ */
+void intPIN2() {
+  if (allowInterrupts) {
+    //ISR
+    intTime = millis();    //filter out interrupts triggered by noise from the first interrupt
+    if (intTime - prevIntTime > 1000) {
+      //Serial.println("INTERRUPT SUCESSFUL");     /////For debugging
+      prevIntTime = intTime;
+      interruptFlag = 1;
+    }
+  }
+}
+
+/**
+ * Returns true, sets interrupt flag to 0, and clears serial port if interrupt is detected
+ */
+boolean checkInterrupt() {
+  if (interruptFlag) {
+    //Serial.println("Interrupt Detected!");     /////For debugging
+    interruptFlag = 0;
+    serialData = 0; //erase serial port
+    return true;
+  }
+  return false;
+}
+
+
+/*______INTERRUPT HANDLER______*/
+
+/**
+ * Handles the waking up of the Arduino.
+ *
+ * Device Status Codes:
+ * 0 - Sample Sleep
+ * 1 - Sampling
+ * 2 - Permanent Sleep, only wakes on interrupts
+ *
+ * Returns:
+ * True - go to main menu
+ * False - continue on in the code
+ */
+
+boolean wakeUpHandler() {
+  while (Serial.available()) {
+    Serial.read();
+  }
+
+  allowInterrupts = 0;       //Disable interrupts
+  Serial.flush();
+  serialData = 0;
+  delay(10);
+
+  if (device_status == 0 || device_status == 2) {    //Device was sleeping
+    if (device_status == 0) {
+      Serial.println(F("Device Status = SAMPLE SLEEP"));
+    }
+    else {
+      Serial.println(F("Device Status = PERMANENT SLEEP"));
+    }
+    Serial.println(F("Wake device from sleep? [Y/N]"));
+    seconds = 0;
+    serialData = 0;
+    while (!Serial.available() && seconds < 10) {} // Wait for characters on serial port and check time out
+    delay(10);
+    if (seconds >= 10) {
+      delay(5);
+      Serial.println(F("Timed out - Going to sleep"));
+      delay(10);
+      return false;
+    }
+    serialData = Serial.read();
+
+    //N or n: puts device back to sleep until interrupt
+    if (serialData == 78 || serialData == 110) {     //  78 -> N, 110 -> n in ASCII
+      Serial.println(F("Returning to sleep"));
+      if (device_status == 2) {
+        sleep(0);
+      }
+      return false;
+    }
+
+    //Y or y input: continue thru main loop
+    else if (serialData == 89 || serialData == 121) {      //  89 -> Y, 121 -> y in ASCII
+      Serial.println(F("Going to Main Menu"));
+      menuFlag = 1;
+      return true;
+    }
+
+    //Invalid Input: Prints invalid input and goes to sleep
+    else if (serialData != 89 || serialData != 121 || serialData != 78 || serialData != 110) {
+      Serial.println(F("Invalid Input - Returning to sleep"));
+      return false;
+    }
+
+  }
+
+  else if (device_status == 1) {         //Device currently sampling
+    Serial.println(F("Device Status = SAMPLING"));
+    Serial.println(F("Exit to Menu [Y/N]?"));
+
+    seconds = 0;
+    while (!Serial.available() && seconds < 10) {} // Wait for characters on serial port and check time out
+    delay(10);
+    if (seconds >= 10) {
+      delay(5);
+      Serial.println(F("Timed out - Resuming sampling"));
+      return false;
+    }
+    serialData = Serial.read();
+
+    //N or n: puts device back to sleep until interrupt
+    if (serialData == 78 || serialData == 110) {     //  78 -> N, 110 -> n in ASCII
+      Serial.println(F("Resuming sampling"));
+      return false;
+    }
+
+    //Y or y input: continue thru main loop
+    else if (serialData == 89 || serialData == 121) {      //  89 -> Y, 121 -> y in ASCII
+      digitalWrite(pressSwitch, LOW);   // turn off the pressure sensor
+      Serial.println(F("Going to Main Menu"));
+      menuFlag = 1;
+      return true;
+    }
+
+    //Invalid Input: Prints invalid input and returns sampling
+    else if (serialData != 89 || serialData != 121 || serialData != 78 || serialData != 110) {
+      Serial.println(F("Invalid Input - Resuming sampling"));
+      return false;
+    }
+
+  }
+
+  else {
+    Serial.println(F("Error Determining Device Status."));
+    Serial.println(F("Going to Main Menu"));
+    menuFlag = 1;
+    return true;
+  }
+
+}
+
+
+
+/*___________FUNCTIONS___________*/
+
+/**
+ * Sampling loop for the pressure sensor.
+ *
+ * Takes samples from Pressure Sensor and writes them to modem, then sleeps
+ * for set period of time.
+ *
+ * Adjust waitTimeBoot for time delay on device start up (default 20 seconds)
+ * Adjust secondsBetweenSamples for time between samples (default 10 seconds)
+ * Adust offCycles for longer sleep time (increments of 8 seconds)
+ */
+void sample() {
+
+//  digitalWrite(pwrPin, HIGH);    //Turn on power to devices
+  delay(10);
+
+  allowInterrupts = 1;  //Re-enable interrupts
+
+  while (true) {
+    digitalWrite(pressSwitch, HIGH);   // turn on the pressure sensor
+    sampleNumber++;                 // increment the sample set number
+
+    waitSeconds(waitTimeBoot);      //wait for pressure sensor voltage to stabilize
+    //check for interrupt
+    if (broke) {
+      broke = 0;
+      return;
+    }
+
+    allowInterrupts = 1;  //Re-enable interrupts
+
+    //Takes N (numSamples) samples from Pressure Sensor, time stamps each one and stores into sampleData
+    for (index = 0; index < numSamples; index++) {
+
+      pressSerial.listen(); //enable pressure sensor serial port
+
+      device_status = 1; //set device status to sampling
+
+      //check for interrupts
+      if (checkInterrupt()) {
+        if (wakeUpHandler()) {
+          return;
+        }
+      }
+      allowInterrupts = 1;  //Re-enable interrupts
+
+      pressSerial.flush();     //Flush the serial
+      /**
+       * Send command to pressSerial port, which is 8(RX), 9 (TX)
+       * The pressure sensor command 'g' followed by a carriage return
+       * will trigger a new reading
+       */
+      pressSerial.print('*');
+      pressSerial.print('G');
+      pressSerial.print('\r');
+      Serial.println(F("Sample Requested."));
+      //clear the buffer
+      for (jIndex = 0; jIndex < 6; jIndex++) {
+        buffer1[jIndex] = ' ';
+      }
+
+      //get time from RTC
+      dataString = getTime();
+
+      seconds = 0;
+      while (!pressSerial.available() && !checkInterrupt() && seconds < menuTimeOut20) {} // Wait for characters on serial port
+
+      if (seconds >= 20) {
+        writeToSDCard(F("No response from pressure sensor."));
+        delay(10);
+        return;
+      }
+
+      if (checkInterrupt()) {
+        if (wakeUpHandler()) {
+          return;
+        }
+      }
+      delay(100);
+
+      //  Read in first 6 characters to buffer (ie. pressure values)
+      for (jIndex = 0; jIndex < 6; jIndex++) {
+        buffer1[jIndex] = pressSerial.read();
+      }
+      Serial.println(F("Sample Taken."));
+      //   Concatenate into YY/MM/DD HH:MM:SS; PRESSURE; SAMPLESET#SAMPLE#
+      //   Ex: "15/08/16 12:00:00; 102156; 11"
+      dataString.concat(space);
+      delay(50);
+      dataString.concat(buffer1);        //Pressure
+      delay(150);
+      //      dataString.concat(sampleNumber);   //Sample Set Number
+      //      dataString.concat(sampleStamp);    //Individual Sample Number (per set)
+      //      delay(150);
+
+      //Writing time stamped data to the SD card
+      writeToSDCard(dataString);
+
+      //Writing data to the modem
+      modemSerial.listen(); //enable modem serial port
+      modemSerial.println(dataString); //print data to modem
+      delay(100);
+
+      waitSeconds(secondsBetweenSamples);  //Wait for 10 seconds until next sample
+
+      //check for interrupt
+      if (broke) {
+        broke = 0;
+        return;
+      }
+      allowInterrupts = 1;  //Re-enable interrupts
+
+      pressSerial.flush();   //Flush serial for any misc. data
+
+    };  //End of SAMPLE LOOP
+
+    digitalWrite(pressSwitch, LOW);    //Turn off pressure pin
+    delay(5);
+
+    if (checkInterrupt()) {         //check for an interrupt
+      if (wakeUpHandler())
+        return;
+    }
+    allowInterrupts = 1;  //Re-enable interrupts
+
+    //Serial.print("Go to sleep for ");    /////For debugging
+    //Serial.println((offCycles * 8) + 4);
+    sleep(offCycles);              //Puts Arduino to Sleep for offCycles
+
+    //check for interrupt
+    if (broke) {
+      broke = 0;
+      return;
+    }
+    allowInterrupts = 1;  //Re-enable interrupts
+  }
+}
+
+
+
+/* Enters into the main menu  */
+void MainMenu() {
+//  digitalWrite(pwrPin, LOW);
+  while (true) {
+    Serial.println();
+    Serial.println(F("MAIN MENU"));
+    Serial.println(F("1. Echo input to Modem"));
+    Serial.println(F("2. Echo input to Pressure Sensor"));
+    Serial.println(F("3. Start taking samples"));
+    Serial.println(F("4. Put controller to sleep"));
+    Serial.println(F("5. Adjust settings\n"));
+    delay(100);
+
+    seconds = 0;      //reset seconds timer
+    while (Serial.available()) {
+      Serial.read();
+    }
+
+    allowInterrupts = 0;       //Disable interrupts
+    Serial.flush();
+    serialData = 0;
+    delay(10);
+
+
+    while (!Serial.available() && seconds < menuTimeOut20) {} // Wait for characters on serial port and check time out
+    delay(10);
+    if (seconds >= menuTimeOut20) {
+      delay(5);
+      Serial.println(F("Timed out - Going to sleep"));
+      delay(10);
+      sleep(0);
+      broke = 0;
+      break;
+    }
+    serialData = Serial.read();
+    switch (serialData) {
+      case 49:       //1 Echo input to modem
+//        digitalWrite(pwrPin, LOW);    //Turn on power to devices
+        echoModem();
+        break;
+
+      case 50:        //2 Echo input to Pressure Sensor
+        echoPressure();
+        break;
+
+      case 51:        //3 Start taking samples
+        Serial.println(F("Taking samples."));
+        delay(10);
+        sample();
+        break;
+
+      case 52:        //4 Go to permanent sleep or run if timed out
+        delay(5);
+        Serial.println(F("Going to sleep"));
+        delay(10);
+        sleep(0);
+        broke = 0;
+        break;
+
+      case 53:        //4 Go to permanent sleep or run if timed out
+        settingsMenu();
+        broke = 0;
+        break;
+
+      default:
+        Serial.println(F("Invalid input - Going to sleep"));
+        sleep(0);
+        broke = 0;
+        break;
+    }
+    if (!menuFlag) {
+      break;
+    }
+  }
+
+}
+
+
+/**
+ * Puts arduino into Sleep Function.
+ *
+ * If cycles = 0, set device to permanent sleep, requires interrupt to wake up
+ * Else, set arduino to sleep for set number of 8 second cycles
+ */
+void sleep(int cycles) {
+//  digitalWrite(pwrPin, LOW);           //Turn off power to external devices
+  delay(10);
+  allowInterrupts = 1;
+  delay(5);
+  if (cycles == 0) {
+    while (!broke) {
+      device_status = 2;
+      delay(2000);
+      LowPower.powerDown(SLEEP_FOREVER, ADC_OFF, BOD_OFF);
+      delay(2000);
+      if (checkInterrupt()) {
+        if (wakeUpHandler()) {
+          broke = 1;
+//          digitalWrite(pwrPin, HIGH);    //Turn on power to devices
+          delay(10);
+          return;
+        }
+        allowInterrupts = 1;
+      }
+    }
+  }
+  else {
+    device_status = 0;
+    for (jIndex = 0; jIndex < cycles; jIndex++) {
+      delay(2000);
+      LowPower.powerDown(SLEEP_8S, ADC_OFF, BOD_OFF);
+      delay(2000);
+      if (checkInterrupt()) {
+        if (wakeUpHandler()) {
+          broke = 1;
+          return;
+//          digitalWrite(pwrPin, HIGH);       //Turn on power to devices
+          delay(10);
+        }
+        allowInterrupts = 1;
+      }
+    }
+  }
+//  digitalWrite(pwrPin, HIGH);              //Turn on power to devices
+  delay(10);
+}
+
+/** Retrieves time from RTC and returns it in YY/MM/DD HH:MM:SS format **/
+String getTime() {
+  DateTime now = RTC.now();     //gets time
+  const int len = 32;
+  static char buf[len];
+  return now.toStringYMD(buf, len); //returns in format mentioned above
+}
+
+/** Retrieves date from RTC and returns it in YYMMDD format **/
+String getDate() {
+  DateTime now = RTC.now();     //gets time
+  const int len = 32;
+  static char buf[len];
+  return now.toStringDate(buf, len); //returns in format mentioned above
+}
+
+/*  Delay the board a set number of seconds using timer 1  */
+void waitSeconds(int timeSec) {
+  allowInterrupts = 1;
+  Serial.print(F("Delay for "));   ////For Debugging
+  Serial.println(timeSec);      ////For Debugging
+  device_status = 1;
+  seconds = 0;
+  int comp = timeSec;
+
+  while (seconds < comp) {
+    delay(5); //don't touch, works but don't know why
+    if (checkInterrupt()) {
+      if (wakeUpHandler()) {
+        broke = 1;
+        return;
+      }
+      allowInterrupts = 1;
+    }
+  }
+}
+
+//Enable talk through to modem
+void echoModem() {
+
+  seconds = 0;
+
+  Serial.println(F("Connected to MODEM"));
+  Serial.println(F("Press '^' to return to Main Menu."));
+  modemSerial.listen();     // Listen to the modem serial port
+
+  Serial.flush();
+  char dataIn = 'a';
+  while (seconds < menuTimeOut60) {
+    dataIn = 0;
+    if (Serial.available()) {
+      seconds = 0;
+      dataIn = Serial.read();
+      if (dataIn == 94) {
+        break;
+      }
+      modemSerial.print(dataIn);
+      //commandString[index++] = dataIn;
+      Serial.print(dataIn);
+    }
+
+    if (modemSerial.available()) {
+      seconds = 0;
+      Serial.print((char)modemSerial.read());
+      //modemSerial.read();
+    }
+  }
+
+}
+
+//Enable talk through to modem
+void echoPressure() {
+
+  seconds = 0; //reset the seconds counter
+
+  Serial.println(F("Powering Pressure Sensor"));
+  digitalWrite(pressSwitch, HIGH);   // turn on the pressure sensor
+  delay(10);
+
+  while (!digitalRead(pressSwitch)); //wait for pressure pin to go high
+
+  Serial.println(F("Connected to PRESSURE SENSOR"));
+  Serial.println(F("Press '^' to return to Main Menu."));
+  delay(50);
+
+  pressSerial.listen();
+
+  Serial.flush();
+  char dataIn = 'a';
+  //continue as long as there is input
+  while (seconds < menuTimeOut60) {
+    dataIn = 0;
+    if (Serial.available()) {
+      seconds = 0;
+      dataIn = Serial.read();
+      if (dataIn == 94) {
+        break;
+      }
+      pressSerial.print(dataIn);
+      //commandString[index++] = dataIn;
+      Serial.print(dataIn);
+    }
+
+    if (pressSerial.available()) {
+      seconds = 0;
+      Serial.print((char)pressSerial.read());
+      //pressSerial.read();
+    }
+  }
+  digitalWrite(pressSwitch, LOW);   // turn off the pressure sensor
+}
+
+/**
+ * Menu that allows changing the length of sleep/awake timers
+ */
+void settingsMenu() {
+  boolean startOver = 1;
+  char dataIn = 'a';
+
+  while (startOver) {
+
+    seconds = 0;      //reset seconds timer
+    while (Serial.available()) {
+      Serial.read();
+    }
+    Serial.flush(); //wait for Serial line to open
+    serialData = 0; //clear serial data
+    delay(10); //wait
+
+    Serial.println(F("Settings:"));
+    Serial.println(F("1. Seconds between samples"));
+    Serial.println(F("2. Sleep time"));
+    Serial.println(F("3. Seconds before sampling begins"));
+    Serial.println(F("4. Adjust Clock"));
+    Serial.println(F("5. Adjust number of samples"));
+    Serial.println(F("\n---- Press '^' to exit ----"));
+    delay(100);
+
+    while (!Serial.available() && seconds < menuTimeOut20); //wait for user input
+
+    delay(10);
+    if (seconds >= menuTimeOut20) {
+      delay(5);
+      Serial.println(F("Timed out - Going to sleep"));
+      delay(10);
+      sleep(0);
+      broke = 0;
+      break;
+    }
+
+    serialData = Serial.read();
+
+    switch (serialData) {
+      case 49:       //edit secondsBetweenSamples
+        Serial.print(F("Current seconds between samples: "));
+        Serial.println(secondsBetweenSamples);
+        Serial.print(F("Enter new desired time: "));
+        delay(100);
+
+        while (!Serial.available());
+        secondsBetweenSamples = Serial.parseInt();
+        Serial.println();
+        Serial.print(F("Updated seconds between samples: "));
+        Serial.println(secondsBetweenSamples);
+        delay(100);
+        break;
+
+      case 50:        //edit Sleep Time
+        Serial.print(F("Current number of 8 second cycles: "));
+        Serial.println(offCycles);
+        Serial.print(F("Enter new amount of cycles: "));
+        delay(100);
+
+        while (!Serial.available());
+        offCycles = Serial.parseInt();
+        Serial.println();
+        Serial.print(F("Updated amount of 8 second cycles: "));
+        Serial.println(offCycles);
+        delay(100);
+        break;
+
+      case 51:        //edit waitTimeBoot
+        Serial.print(F("Current seconds to wait until sampling begins: "));
+        Serial.println(waitTimeBoot);
+        Serial.print(F("Enter new desired time: "));
+        delay(100);
+
+        while (!Serial.available());
+        waitTimeBoot = Serial.parseInt();
+        Serial.println();
+        Serial.print(F("Updated seconds to wait until sampling begins: "));
+        Serial.println(waitTimeBoot);
+        delay(100);
+        break;
+
+      case 52:        //Adjust RTC
+        timeStamp = getTime();
+        Serial.print(F("Current Time is: "));
+        Serial.println(timeStamp);
+        Serial.println(F("Change current time? [Y/N]"));
+        seconds = 0;
+        while (!Serial.available() && seconds < 30) {} // Wait for characters on serial port and check time out
+        if (seconds >= 30) {
+          delay(5);
+          Serial.println(F("Timed out"));
+          break;
+        }
+        serialData = Serial.read();
+
+        //N or n: Go back to Settings Menu
+        if (serialData == 78 || serialData == 110) {     //  78 -> N, 110 -> n in ASCII
+          Serial.println(F("Returning to Settings Menu"));
+          break;
+        }
+
+        //Y or y input: Change current Time
+        else if (serialData == 89 || serialData == 121) {      //  89 -> Y, 121 -> y in ASCII
+          Serial.println(F("Input date: Mon DD YYYY "));
+          delay(5);
+          parseSerial();
+          for (index = 0; index < 11; index++) {
+            DATE[index] = commandString[index];
+          }
+
+          Serial.println(F("\nInput time: hh:mm:ss "));
+          delay(5);
+          parseSerial();
+          for (index = 0; index < 8; index++) {
+            TIME[index] = commandString[index];
+          }
+
+          RTC.adjust(DateTime(DATE, TIME));   //sets the RTC to the date & time file was compiled
+
+          Serial.print(F("Time set to : "));
+          delay(10);
+          Serial.println(getTime() + "\n");
+          delay(10);
+          break;
+        }
+
+        //Invalid Input: Go back to Settings Menu
+        else if (serialData != 89 || serialData != 121 || serialData != 78 || serialData != 110) {
+          Serial.println(F("Invalid Input - Returning to Menu"));
+          break;
+        }
+
+      case 53:   //adjust number of samples
+        Serial.print(F("Current number of samples taken: "));
+        Serial.println(numSamples);
+        Serial.print(F("Enter desired amount to be taken: "));
+        delay(100);
+
+        while (!Serial.available());
+        numSamples = Serial.parseInt();
+        Serial.println();
+        Serial.print(F("Updated amount of samples to be taken: "));
+        Serial.println(numSamples);
+        delay(100);
+        break;
+
+      case 94:
+        startOver = 0;
+        break;
+
+      default:
+        Serial.println(F("Invalid Input"));
+        break;
+    }
+  }
+}
+
+void parseSerial() {
+  for (index = 0; index < 12; commandString[index++] = 0x00);
+  index = 0;
+  Serial.flush();
+  char dataIn = 'a';
+  while (dataIn != 13 && index < 12) {
+    while (!Serial.available());
+    dataIn = Serial.read();
+    commandString[index++] = dataIn;
+    Serial.print(dataIn);
+
+    if (index == 13) {
+      Serial.println("Command cannot be more than 12 chars.");
+      break;
+    }
+
+    if (dataIn == 13) {
+      Serial.println();//new line
+      commandString[index] = 0x00;//append null charater to end of string
+      delay(100);
+      break;
+    }
+  }
+}
+
+void writeToSDCard(String input) {
+  DATESTAMP = getDate();
+  DATESTAMP.concat(".txt");
+  File dataFile = SD.open(DATESTAMP, FILE_WRITE);
+  if (dataFile) {
+    dataFile.println(input);
+    Serial.println(input);
+    dataFile.close();
+  } else {
+    Serial.println(F("Error printing to SD Card"));
+    dataFile.close();
+  }
+}
